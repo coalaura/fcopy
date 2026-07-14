@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"path"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 
 type exclusionMatcher struct {
 	patterns []exclusionPattern
+	names    map[string]struct{}
 }
 
 type exclusionPattern struct {
@@ -17,9 +19,22 @@ type exclusionPattern struct {
 	hasRecursive bool
 }
 
-func newExclusionMatcher(patterns []string) (*exclusionMatcher, error) {
+func newExclusionMatcher(patterns []string, names []string) (*exclusionMatcher, error) {
 	matcher := &exclusionMatcher{
 		patterns: make([]exclusionPattern, 0, len(patterns)),
+		names:    make(map[string]struct{}, len(names)),
+	}
+
+	for _, name := range names {
+		if name == "" {
+			return nil, errors.New("exclude name must not be empty")
+		}
+
+		if strings.ContainsAny(name, `/\`) || name == "." || name == ".." {
+			return nil, fmt.Errorf("%q is not a basename", name)
+		}
+
+		matcher.names[name] = struct{}{}
 	}
 
 	for _, pattern := range patterns {
@@ -64,6 +79,11 @@ func (matcher *exclusionMatcher) matches(relativePath string) bool {
 
 	normalized := filepath.ToSlash(relativePath)
 	pathSegments := strings.Split(normalized, "/")
+	baseName := pathSegments[len(pathSegments)-1]
+
+	if _, excluded := matcher.names[baseName]; excluded {
+		return true
+	}
 
 	for _, pattern := range matcher.patterns {
 		if pattern.matchBase {

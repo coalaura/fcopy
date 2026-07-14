@@ -3,6 +3,8 @@
 package main
 
 import (
+	"errors"
+	"io"
 	"io/fs"
 	"os"
 	"unsafe"
@@ -14,7 +16,27 @@ const symbolicLinkFlagAllowUnprivilegedCreate uint32 = 0x2
 
 var copyFileW = windows.NewLazySystemDLL("kernel32.dll").NewProc("CopyFileW")
 
-func nativeCopyFile(source, destination string) error {
+func nativeCopyFile(source, destination string, reflink reflinkMode) error {
+	switch reflink {
+	case reflinkAlways:
+		return errors.New("reflink=always is not supported on Windows")
+	case reflinkNever:
+		src, err := os.Open(source)
+		if err != nil {
+			return err
+		}
+		defer src.Close()
+
+		dst, err := os.OpenFile(destination, os.O_WRONLY|os.O_TRUNC, 0)
+		if err != nil {
+			return err
+		}
+		defer dst.Close()
+
+		_, err = io.Copy(dst, src)
+		return err
+	}
+
 	sourceName, err := windows.UTF16PtrFromString(source)
 	if err != nil {
 		return err

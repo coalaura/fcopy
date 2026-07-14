@@ -12,32 +12,48 @@ import (
 	"sync/atomic"
 )
 
+type collisionMode uint8
+
+const (
+	collisionReplace collisionMode = iota
+	collisionWarn
+	collisionFail
+)
+
+type reflinkMode uint8
+
+const (
+	reflinkAuto reflinkMode = iota
+	reflinkAlways
+	reflinkNever
+)
+
 type copyOptions struct {
-	workers int
-	exclude *exclusionMatcher
+	workers     int
+	exclude     *exclusionMatcher
+	collision   collisionMode
+	reflink     reflinkMode
+	dereference bool
+	onCopied    func(source, destination string)
+	onWarning   func(message string)
 }
 
 type copyStats struct {
-	files       int64
-	directories int64
-	symlinks    int64
-	bytes       int64
+	files             int64
+	directories       int64
+	symlinks          int64
+	bytes             int64
+	exclusions        int64
+	collisionsSkipped int64
 }
 
 type atomicCopyStats struct {
-	files       atomic.Int64
-	directories atomic.Int64
-	symlinks    atomic.Int64
-	bytes       atomic.Int64
-}
-
-func (stats *atomicCopyStats) load() copyStats {
-	return copyStats{
-		files:       stats.files.Load(),
-		directories: stats.directories.Load(),
-		symlinks:    stats.symlinks.Load(),
-		bytes:       stats.bytes.Load(),
-	}
+	files             atomic.Int64
+	directories       atomic.Int64
+	symlinks          atomic.Int64
+	bytes             atomic.Int64
+	exclusions        atomic.Int64
+	collisionsSkipped atomic.Int64
 }
 
 type copyJob struct {
@@ -49,6 +65,17 @@ type copyJob struct {
 type directoryJob struct {
 	path string
 	info fs.FileInfo
+}
+
+func (stats *atomicCopyStats) load() copyStats {
+	return copyStats{
+		files:             stats.files.Load(),
+		directories:       stats.directories.Load(),
+		symlinks:          stats.symlinks.Load(),
+		bytes:             stats.bytes.Load(),
+		exclusions:        stats.exclusions.Load(),
+		collisionsSkipped: stats.collisionsSkipped.Load(),
+	}
 }
 
 func copyPath(ctx context.Context, source string, destination string, options copyOptions) (copyStats, error) {
@@ -65,6 +92,13 @@ func copyPath(ctx context.Context, source string, destination string, options co
 	sourceInfo, err := os.Lstat(source)
 	if err != nil {
 		return copyStats{}, fmt.Errorf("inspect source %q: %w", source, err)
+	}
+
+	if options.dereference && sourceInfo.Mode()&fs.ModeSymlink != 0 {
+		sourceInfo, err = os.Stat(source)
+		if err != nil {
+			return copyStats{}, fmt.Errorf("dereference source %q: %w", source, err)
+		}
 	}
 
 	if !sourceInfo.IsDir() {
@@ -94,14 +128,18 @@ func copyPath(ctx context.Context, source string, destination string, options co
 
 	var stats atomicCopyStats
 
-	err = copyEntry(copyJob{
+	copied, err := copyEntry(copyJob{
 		source:      source,
 		destination: destination,
 		info:        sourceInfo,
-	}, &stats)
+	}, options, &stats)
 
 	if err != nil {
-		return copyStats{}, err
+		return stats.load(), err
+	}
+
+	if copied && options.onCopied != nil {
+		options.onCopied(source, destination)
 	}
 
 	return stats.load(), nil
@@ -139,11 +177,15 @@ func copyDirectory(parentCtx context.Context, source string, destination string,
 						return
 					}
 
-					err := copyEntry(job, &stats)
+					copied, err := copyEntry(job, options, &stats)
 					if err != nil {
 						cancel(fmt.Errorf("copy %q to %q: %w", job.source, job.destination, err))
 
 						return
+					}
+
+					if copied && options.onCopied != nil {
+						options.onCopied(job.source, job.destination)
 					}
 				}
 			}
@@ -151,37 +193,38 @@ func copyDirectory(parentCtx context.Context, source string, destination string,
 	}
 
 	directories := make([]directoryJob, 0, 128)
+	activeDirectories := make(map[string]struct{})
 
-	walkErr := filepath.WalkDir(source, func(path string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
+	var walk func(path, relativePath string, info fs.FileInfo) error
 
-		relativePath, err := filepath.Rel(source, path)
-		if err != nil {
-			return fmt.Errorf("resolve relative path for %q: %w", path, err)
-		}
-
-		if relativePath != "." && options.exclude.matches(relativePath) {
-			if entry.IsDir() {
-				return filepath.SkipDir
-			}
-
-			return nil
-		}
-
-		info, err := entry.Info()
-		if err != nil {
-			return fmt.Errorf("inspect %q: %w", path, err)
+	walk = func(path, relativePath string, info fs.FileInfo) error {
+		if err := context.Cause(ctx); err != nil {
+			return err
 		}
 
 		destinationPath := destination
-
 		if relativePath != "." {
 			destinationPath = filepath.Join(destination, relativePath)
 		}
 
 		if info.IsDir() {
+			canonical, err := filepath.EvalSymlinks(path)
+			if err != nil {
+				return fmt.Errorf("resolve directory %q: %w", path, err)
+			}
+
+			canonical, err = filepath.Abs(canonical)
+			if err != nil {
+				return fmt.Errorf("resolve directory path %q: %w", path, err)
+			}
+
+			if _, exists := activeDirectories[canonical]; exists {
+				return fmt.Errorf("symbolic link cycle at %q", path)
+			}
+
+			activeDirectories[canonical] = struct{}{}
+			defer delete(activeDirectories, canonical)
+
 			if relativePath != "." {
 				err := prepareDirectory(destinationPath, info.Mode().Perm())
 				if err != nil {
@@ -195,6 +238,42 @@ func copyDirectory(parentCtx context.Context, source string, destination string,
 			})
 
 			stats.directories.Add(1)
+
+			entries, err := os.ReadDir(path)
+			if err != nil {
+				return fmt.Errorf("read directory %q: %w", path, err)
+			}
+
+			for _, entry := range entries {
+				childPath := filepath.Join(path, entry.Name())
+				childRelativePath := entry.Name()
+				if relativePath != "." {
+					childRelativePath = filepath.Join(relativePath, entry.Name())
+				}
+
+				if options.exclude.matches(childRelativePath) {
+					stats.exclusions.Add(1)
+
+					continue
+				}
+
+				childInfo, err := entry.Info()
+				if err != nil {
+					return fmt.Errorf("inspect %q: %w", childPath, err)
+				}
+
+				if options.dereference && childInfo.Mode()&fs.ModeSymlink != 0 {
+					childInfo, err = os.Stat(childPath)
+					if err != nil {
+						return fmt.Errorf("dereference %q: %w", childPath, err)
+					}
+				}
+
+				err = walk(childPath, childRelativePath, childInfo)
+				if err != nil {
+					return err
+				}
+			}
 
 			return nil
 		}
@@ -211,15 +290,14 @@ func copyDirectory(parentCtx context.Context, source string, destination string,
 		case <-ctx.Done():
 			return context.Cause(ctx)
 		}
-	},
-	)
+	}
 
+	walkErr := walk(source, ".", sourceInfo)
 	if walkErr != nil {
 		cancel(fmt.Errorf("walk source %q: %w", source, walkErr))
 	}
 
 	close(jobs)
-
 	workers.Wait()
 
 	err = context.Cause(ctx)
@@ -239,33 +317,67 @@ func copyDirectory(parentCtx context.Context, source string, destination string,
 	return stats.load(), nil
 }
 
-func copyEntry(job copyJob, stats *atomicCopyStats) error {
+func copyEntry(job copyJob, options copyOptions, stats *atomicCopyStats) (bool, error) {
+	copyDestination, err := handleCollision(job, options, stats)
+	if err != nil || !copyDestination {
+		return false, err
+	}
+
 	switch {
 	case job.info.Mode().IsRegular():
-		err := copyRegularFile(job)
+		err := copyRegularFile(job, options.reflink)
 		if err != nil {
-			return err
+			return false, err
 		}
 
 		stats.files.Add(1)
 		stats.bytes.Add(job.info.Size())
 
-		return nil
+		return true, nil
 	case job.info.Mode()&fs.ModeSymlink != 0:
 		err := copySymbolicLink(job)
 		if err != nil {
-			return err
+			return false, err
 		}
 
 		stats.symlinks.Add(1)
 
-		return nil
+		return true, nil
 	default:
-		return fmt.Errorf("unsupported file type %s", job.info.Mode().Type())
+		return false, fmt.Errorf("unsupported file type %s", job.info.Mode().Type())
 	}
 }
 
-func copyRegularFile(job copyJob) error {
+func handleCollision(job copyJob, options copyOptions, stats *atomicCopyStats) (bool, error) {
+	if options.collision == collisionReplace {
+		return true, nil
+	}
+
+	_, err := os.Lstat(job.destination)
+
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return true, nil
+	case err != nil:
+		return false, fmt.Errorf("inspect destination: %w", err)
+	case options.collision == collisionFail:
+		return false, fmt.Errorf("destination %q already exists", job.destination)
+	default:
+		stats.collisionsSkipped.Add(1)
+
+		if options.onWarning != nil {
+			options.onWarning(fmt.Sprintf(
+				"destination %q already exists; skipping %q",
+				job.destination,
+				job.source,
+			))
+		}
+
+		return false, nil
+	}
+}
+
+func copyRegularFile(job copyJob, reflink reflinkMode) error {
 	err := checkReplaceable(job.destination)
 	if err != nil {
 		return err
@@ -289,7 +401,7 @@ func copyRegularFile(job copyJob) error {
 
 	defer os.Remove(temporaryPath)
 
-	err = nativeCopyFile(job.source, temporaryPath)
+	err = nativeCopyFile(job.source, temporaryPath, reflink)
 	if err != nil {
 		return fmt.Errorf("copy file data: %w", err)
 	}

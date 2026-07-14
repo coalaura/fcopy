@@ -33,6 +33,46 @@ Set the maximum number of concurrent file copies:
 fcopy --workers 16 source destination
 ```
 
+Use literal recursive basename exclusions with `--exclude-name`:
+
+```sh
+fcopy --exclude-name .DS_Store --exclude-name generated.go source destination
+```
+
+Control destination collisions:
+
+```sh
+fcopy --collision replace source destination
+fcopy --collision warn source destination
+fcopy --collision fail source destination
+```
+
+Follow symbolic links instead of copying the links themselves:
+
+```sh
+fcopy --dereference source destination
+```
+
+Control copy-on-write cloning:
+
+```sh
+fcopy --reflink auto source destination
+fcopy --reflink always source destination
+fcopy --reflink never source destination
+```
+
+Suppress per-file messages while retaining warnings, errors, and the final summary:
+
+```sh
+fcopy --quiet source destination
+```
+
+Emit a JSON report:
+
+```sh
+fcopy --json source destination
+```
+
 Run `fcopy --help` for all available options.
 
 ## Build

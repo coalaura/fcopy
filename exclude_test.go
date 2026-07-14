@@ -65,10 +65,52 @@ func TestExclusionMatcher(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
-			matcher, err := newExclusionMatcher(test.patterns)
+			matcher, err := newExclusionMatcher(test.patterns, nil)
 			if err != nil {
 				t.Fatalf("newExclusionMatcher() error = %v", err)
 			}
+
+			got := matcher.matches(test.path)
+			if got != test.want {
+				t.Errorf("matches(%q) = %v, want %v", test.path, got, test.want)
+			}
+		})
+	}
+}
+
+func TestExclusionMatcherName(t *testing.T) {
+	t.Parallel()
+
+	matcher, err := newExclusionMatcher(nil, []string{"generated.go"})
+	if err != nil {
+		t.Fatalf("newExclusionMatcher() error = %v", err)
+	}
+
+	tests := []struct {
+		name string
+		path string
+		want bool
+	}{
+		{
+			name: "root",
+			path: "generated.go",
+			want: true,
+		},
+		{
+			name: "nested",
+			path: "internal/api/generated.go",
+			want: true,
+		},
+		{
+			name: "literal does not use glob syntax",
+			path: "generatedXgo",
+			want: false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
 
 			got := matcher.matches(test.path)
 			if got != test.want {

@@ -4,6 +4,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
@@ -14,7 +15,7 @@ import (
 
 const chunkSize = 1 << 30
 
-func nativeCopyFile(source, destination string) error {
+func nativeCopyFile(source, destination string, reflink reflinkMode) error {
 	src, err := os.Open(source)
 	if err != nil {
 		return err
@@ -28,6 +29,31 @@ func nativeCopyFile(source, destination string) error {
 	}
 
 	defer dst.Close()
+
+	if reflink != reflinkNever {
+		err = unix.IoctlFileClone(int(dst.Fd()), int(src.Fd()))
+		if err == nil {
+			return nil
+		}
+
+		if reflink == reflinkAlways {
+			return fmt.Errorf("create reflink: %w", err)
+		}
+
+		if !reflinkUnsupported(err) {
+			return fmt.Errorf("create reflink: %w", err)
+		}
+
+		err = dst.Truncate(0)
+		if err != nil {
+			return err
+		}
+	}
+
+	if reflink == reflinkNever {
+		_, err = io.Copy(dst, src)
+		return err
+	}
 
 	for {
 		copied, err := unix.CopyFileRange(int(src.Fd()), nil, int(dst.Fd()), nil, chunkSize, 0)
@@ -61,6 +87,10 @@ func nativeCopyFile(source, destination string) error {
 		_, err = io.Copy(dst, src)
 		return err
 	}
+}
+
+func reflinkUnsupported(err error) bool {
+	return errors.Is(err, syscall.EXDEV) || errors.Is(err, syscall.EINVAL) || errors.Is(err, syscall.ENOTTY) || errors.Is(err, syscall.EOPNOTSUPP)
 }
 
 func copyFileRangeUnsupported(err error) bool {
