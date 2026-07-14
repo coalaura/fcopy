@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v6
+
+    - name: Set up Go
+      uses: actions/setup-go@v6
+      with:
+        go-version-file: go.mod
+        cache: true
+
+    - name: Run tests
+      run: go test ./...
+
+    - name: Run vet
+      run: go vet ./...
+
+    - name: Run integration test
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        workspace="$(mktemp -d)"
+        trap 'rm -rf "$workspace"' EXIT
+
+        go build -o "$workspace/fcopy" .
+
+        source="$workspace/source"
+        destination="$workspace/destination"
+        expected="$workspace/expected"
+
+        mkdir -p \
+          "$source/nested/deep" \
+          "$source/ignored"
+
+        printf 'root\n' > "$source/root.txt"
+        printf 'nested\n' > "$source/nested/file.txt"
+        printf 'deep\n' > "$source/nested/deep/file.txt"
+        printf 'excluded\n' > "$source/nested/file.tmp"
+        printf 'ignored\n' > "$source/ignored/file.txt"
+        ln -s ../root.txt "$source/nested/root-link"
+
+        cp -a "$source" "$expected"
+        rm -rf "$expected/ignored"
+        rm "$expected/nested/file.tmp"
+
+        "$workspace/fcopy" \
+          --exclude '*.tmp' \
+          --exclude 'ignored/**' \
+          "$source" "$destination"
+
+        diff -r "$expected" "$destination"
+        test -L "$destination/nested/root-link"
+        test "$(readlink "$destination/nested/root-link")" = '../root.txt'
+        test ! -e "$destination/nested/file.tmp"
+        test ! -e "$destination/ignored"

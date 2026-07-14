@@ -12,55 +12,7 @@ env:
   project_name: fcopy
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
-
-    steps:
-    - name: Checkout
-      uses: actions/checkout@v6
-
-    - name: Set up Go
-      uses: actions/setup-go@v6
-      with:
-        go-version-file: 'go.mod'
-        cache: true
-
-    - name: Test
-      run: go test ./...
-
-    - name: Vet
-      run: go vet ./...
-
-    - name: Integration test
-      shell: bash
-      run: |
-        go build -o bin/fcopy .
-
-        mkdir -p testdata/source/nested testdata/source/ignored
-        printf 'root\n' > testdata/source/root.txt
-        printf 'nested\n' > testdata/source/nested/file.txt
-        printf 'excluded\n' > testdata/source/nested/file.tmp
-        printf 'ignored\n' > testdata/source/ignored/file.txt
-        ln -s ../root.txt testdata/source/nested/root-link
-
-        mkdir -p testdata/expected
-        cp -a testdata/source/. testdata/expected/
-        rm -rf testdata/expected/ignored
-        rm testdata/expected/nested/file.tmp
-
-        ./bin/fcopy \
-          --exclude '*.tmp' \
-          --exclude 'ignored/**' \
-          testdata/source testdata/destination
-
-        diff -r testdata/expected testdata/destination
-        test -L testdata/destination/nested/root-link
-        test "$(readlink testdata/destination/nested/root-link)" = "../root.txt"
-        test ! -e testdata/destination/nested/file.tmp
-        test ! -e testdata/destination/ignored
-
   build:
-    needs: test
     runs-on: ubuntu-latest
     strategy:
       matrix:
